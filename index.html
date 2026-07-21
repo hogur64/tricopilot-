@@ -83,7 +83,7 @@ function computeLoads(sessions, daysBack = 120) {
 }
 
 /* ============ Risque migraine ============ */
-function migraineRisk(daily, loads) {
+function migraineRisk(daily, loads, wx) {
   const t = todayISO();
   const d0 = daily[t] || {}, d1 = daily[addDays(t, -1)] || {}, d2 = daily[addDays(t, -2)] || {};
   let score = 0; const reasons = [];
@@ -98,6 +98,8 @@ function migraineRisk(daily, loads) {
   if (last && last.tsb < -25) { score += 1.5; reasons.push(`Fatigue d'entraînement (TSB ${last.tsb})`); }
   if (d1.coffee !== undefined && d0.coffee !== undefined && Math.abs(d0.coffee - d1.coffee) >= 2) { score += 1; reasons.push("Variation brutale de caféine"); }
   if ((d1.alcohol ?? 0) > 0) { score += 0.5; reasons.push("Alcool hier"); }
+  if (wx && wx.deltaP !== null && wx.deltaP !== undefined && wx.deltaP <= -5) { score += 1.5; reasons.push(`Chute de pression atmosphérique (${wx.deltaP} hPa)`); }
+  if (wx && wx.tmax >= 30) { score += 0.5; reasons.push(`Forte chaleur (${wx.tmax}°C)`); }
   const level = score >= 5 ? "élevé" : score >= 2.5 ? "modéré" : "faible";
   return { score: Math.min(10, +score.toFixed(1)), level, reasons };
 }
@@ -161,7 +163,7 @@ function globalScore(daily, loads, risk) {
 }
 
 /* ============ Contexte + appel coach IA (clé API personnelle) ============ */
-function buildContext(profile, sessions, daily, migraines, loads, plan) {
+function buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx) {
   const last = loads[loads.length - 1] || {};
   const recentDaily = {};
   for (let i = 0; i < 14; i++) { const d = addDays(todayISO(), -i); if (daily[d]) recentDaily[d] = daily[d]; }
@@ -172,6 +174,8 @@ function buildContext(profile, sessions, daily, migraines, loads, plan) {
     journal_14j: recentDaily,
     migraines_recentes: migraines.slice(-10),
     plan_entrainement: plan || null,
+    douleurs_recentes: (pains || []).slice(-10),
+    meteo_du_jour: wx || null,
     date_du_jour: todayISO(),
   });
 }
@@ -191,6 +195,34 @@ async function askCoach(history, context, apiKey) {
   if (!res.ok) throw new Error("api " + res.status);
   const data = await res.json();
   return (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n") || "Erreur de réponse.";
+}
+
+/* ============ Météo & pression (Open-Meteo, sans clé) ============ */
+async function fetchWeather(prevWx) {
+  const pos = await new Promise((res, rej) => {
+    if (!navigator.geolocation) return rej(new Error("no geo"));
+    navigator.geolocation.getCurrentPosition(res, rej, { timeout: 8000, maximumAge: 3600000 });
+  });
+  const { latitude, longitude } = pos.coords;
+  const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,surface_pressure,weather_code&daily=temperature_2m_max&forecast_days=1&timezone=auto`);
+  if (!r.ok) throw new Error("wx");
+  const j = await r.json();
+  const pressure = j.current.surface_pressure;
+  const deltaP = prevWx && prevWx.pressure && prevWx.date !== todayISO() ? +(pressure - prevWx.pressure).toFixed(1) : (prevWx ? prevWx.deltaP : null);
+  return { date: todayISO(), temp: Math.round(j.current.temperature_2m), tmax: Math.round(j.daily.temperature_2m_max[0]), pressure: +pressure.toFixed(1), deltaP, code: j.current.weather_code };
+}
+function hydrationTarget(profile, sessions, wx) {
+  const w = +profile.weightKg || 70;
+  const trainMin = sessions.filter(x => x.date === todayISO()).reduce((a, x) => a + x.durationMin, 0);
+  let L = w * 0.035 + (trainMin / 60) * 0.6;
+  if (wx && wx.tmax >= 27) L += 0.5;
+  return +L.toFixed(1);
+}
+function dailyAdvice(last, risk) {
+  if (risk.level === "élevé") return "Priorité prévention migraine : hydrate-toi, limite l'écran, séance légère uniquement.";
+  if (last && last.tsb < -25) return "Surcharge d'entraînement : repos ou mobilité aujourd'hui, pas de négociation.";
+  if (last && last.tsb > 5) return "Fraîcheur au vert : bon jour pour placer une séance intense.";
+  return "Zone productive : endurance 40-60 min si c'est au plan, sinon récupération active.";
 }
 
 /* ============ Objectifs nutrition (Mifflin-St Jeor, estimation) ============ */
@@ -298,6 +330,8 @@ function TriCopilot() {
   const [chat, setChat] = useState([]);
   const [apiKey, setApiKey] = useState("");
   const [plan, setPlan] = useState(null);
+  const [pains, setPains] = useState([]);
+  const [wx, setWx] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -308,6 +342,10 @@ function TriCopilot() {
       setChat(await loadKey("chat", []));
       setApiKey(await loadKey("apikey", ""));
       setPlan(await loadKey("plan", null));
+      setPains(await loadKey("pains", []));
+      const storedWx = await loadKey("wx", null);
+      if (storedWx && storedWx.date === todayISO()) setWx(storedWx);
+      else fetchWeather(storedWx).then(w => { setWx(w); saveKey("wx", w); }).catch(() => { if (storedWx) setWx(storedWx); });
       setDark((await loadKey("theme", "dark")) === "dark");
       setReady(true);
     })();
@@ -315,7 +353,7 @@ function TriCopilot() {
   useEffect(() => { window.scrollTo(0, 0); }, [view]);
 
   const loads = useMemo(() => computeLoads(sessions), [sessions]);
-  const risk = useMemo(() => migraineRisk(daily, loads), [daily, loads]);
+  const risk = useMemo(() => migraineRisk(daily, loads, wx), [daily, loads, wx]);
   const gScore = useMemo(() => globalScore(daily, loads, risk), [daily, loads, risk]);
   const correls = useMemo(() => migraineCorrelations(migraines, daily), [migraines, daily]);
 
@@ -327,6 +365,7 @@ function TriCopilot() {
     chat: v => { setChat(v); saveKey("chat", v); },
     apiKey: v => { setApiKey(v); saveKey("apikey", v); },
     plan: v => { setPlan(v); saveKey("plan", v); },
+    pains: v => { setPains(v); saveKey("pains", v); },
     theme: d => { setDark(d); saveKey("theme", d ? "dark" : "light"); },
   };
 
@@ -340,7 +379,7 @@ function TriCopilot() {
     ["coach", "Coach", "◆"],
     ["plus", "Plus", "⋯"],
   ];
-  const sub = ["migraines", "rapport", "profil", "plan"].includes(view);
+  const sub = ["migraines", "rapport", "profil", "plan", "douleurs"].includes(view);
 
   return (
     <div className={dark ? "tc-root tc-dark" : "tc-root tc-light"}>
@@ -351,15 +390,16 @@ function TriCopilot() {
         <button className="tc-theme" onClick={() => persist.theme(!dark)} aria-label="Changer de thème">{dark ? "☀" : "☾"}</button>
       </header>
       <main className="tc-page">
-        {view === "accueil" && <Accueil profile={profile} loads={loads} risk={risk} gScore={gScore} sessions={sessions} daily={daily} setView={setView} />}
+        {view === "accueil" && <Accueil profile={profile} loads={loads} risk={risk} gScore={gScore} sessions={sessions} daily={daily} setView={setView} wx={wx} />}
         {view === "seances" && <Seances sessions={sessions} save={persist.sessions} />}
-        {view === "journal" && <Journal daily={daily} save={persist.daily} profile={profile} sessions={sessions} />}
-        {view === "coach" && <Coach chat={chat} save={persist.chat} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan)} />}
+        {view === "journal" && <Journal daily={daily} save={persist.daily} profile={profile} sessions={sessions} wx={wx} />}
+        {view === "coach" && <Coach chat={chat} save={persist.chat} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} />}
         {view === "plus" && <Plus setView={setView} />}
-        {view === "plan" && <PlanView plan={plan} save={persist.plan} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan)} sessions={sessions} saveSessions={persist.sessions} />}
+        {view === "plan" && <PlanView plan={plan} save={persist.plan} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} sessions={sessions} saveSessions={persist.sessions} />}
+        {view === "douleurs" && <Pains pains={pains} save={persist.pains} />}
         {view === "migraines" && <Migraines migraines={migraines} save={persist.migraines} risk={risk} correls={correls} />}
         {view === "rapport" && <Rapport sessions={sessions} daily={daily} loads={loads} migraines={migraines} />}
-        {view === "profil" && <><Onboarding initial={profile} onDone={persist.profile} edit /><Reglages apiKey={apiKey} saveApiKey={persist.apiKey} data={{ profile, sessions, daily, migraines }} restore={persist} /></>}
+        {view === "profil" && <><Onboarding initial={profile} onDone={persist.profile} edit /><Reglages apiKey={apiKey} saveApiKey={persist.apiKey} data={{ profile, sessions, daily, migraines, pains, plan }} restore={persist} /></>}
       </main>
       <nav className="tc-tabbar">
         {TABS.map(([k, l, ic]) => (
@@ -374,16 +414,41 @@ function TriCopilot() {
 
 /* ---------- Contrôles tactiles ---------- */
 function Stepper({ label, value, onChange, step = 1, min = 0, max = 24, unit = "" }) {
-  const v = value ?? null;
-  const dec = () => onChange(Math.max(min, +((v ?? 0) - step).toFixed(2)));
-  const inc = () => onChange(Math.min(max, +((v ?? 0) + step).toFixed(2)));
+  const v = value === undefined || value === null ? null : value;
+  const [txt, setTxt] = useState(v === null ? "" : String(v));
+  const [focus, setFocus] = useState(false);
+  useEffect(() => { if (!focus) setTxt(v === null ? "" : String(v)); }, [v, focus]);
+  const clamp = x => Math.max(min, Math.min(max, x));
+  const dec = () => onChange(clamp(+((v ?? 0) - step).toFixed(2)));
+  const inc = () => onChange(clamp(+((v ?? 0) + step).toFixed(2)));
+  const type = e => {
+    const raw = e.target.value; setTxt(raw);
+    if (raw.trim() === "") { onChange(undefined); return; }
+    const n = parseFloat(raw.replace(",", "."));
+    if (!isNaN(n)) onChange(clamp(n));
+  };
   return (
     <div className="tc-stepper">
-      <span className="tc-steplabel">{label}</span>
+      <span className="tc-steplabel">{label}{unit ? ` (${unit})` : ""}</span>
       <div className="tc-stepctl">
         <button onClick={dec} aria-label={"Diminuer " + label}>−</button>
-        <span className="tc-stepval">{v === null ? "—" : v}{v !== null && unit ? ` ${unit}` : ""}</span>
+        <input className="tc-stepin" type="text" inputMode="decimal" value={txt} placeholder="—"
+          onChange={type} onFocus={() => setFocus(true)} onBlur={() => setFocus(false)} />
         <button onClick={inc} aria-label={"Augmenter " + label}>+</button>
+      </div>
+    </div>
+  );
+}
+function MultiChips({ label, options, values, onChange }) {
+  const vals = values || [];
+  const toggle = o => onChange(vals.includes(o) ? vals.filter(x => x !== o) : [...vals, o]);
+  return (
+    <div className="tc-chipsrow">
+      <span className="tc-steplabel">{label}</span>
+      <div className="tc-chips">
+        {options.map(o => (
+          <button key={o} className={vals.includes(o) ? "tc-chip active" : "tc-chip"} onClick={() => toggle(o)}>{o}</button>
+        ))}
       </div>
     </div>
   );
@@ -407,7 +472,8 @@ function Field({ label, children }) {
 }
 
 /* ---------- Accueil ---------- */
-function Accueil({ profile, loads, risk, gScore, sessions, daily, setView }) {
+function Accueil({ profile, loads, risk, gScore, sessions, daily, setView, wx }) {
+  const hydroT = hydrationTarget(profile, sessions, wx);
   const last = loads[loads.length - 1] || {};
   const daysToRace = profile.goalDate ? Math.ceil((new Date(profile.goalDate) - new Date()) / 86400000) : null;
   const chartData = loads.slice(-42);
@@ -437,6 +503,15 @@ function Accueil({ profile, loads, risk, gScore, sessions, daily, setView }) {
         <button className={todayDone ? "tc-bigbtn tc-bigbtn2 done" : "tc-bigbtn tc-bigbtn2"} onClick={() => setView("journal")}>
           {todayDone ? "✓ Journal rempli — modifier" : "Remplir le journal du jour"}
         </button>
+      </div>
+
+      <div className="tc-card">
+        <div className="tc-cardtitle">Briefing du jour</div>
+        <div className="tc-row"><span>Sommeil hier</span><b>{(daily[addDays(todayISO(), -1)] || {}).sleepH !== undefined ? `${daily[addDays(todayISO(), -1)].sleepH} h` : "non renseigné"}</b></div>
+        <div className="tc-row"><span>Charge (TSB)</span><b>{last.tsb ?? "—"} · {last.tsb > 5 ? "frais" : last.tsb > -10 ? "productif" : last.tsb > -25 ? "fatigué" : "surcharge"}</b></div>
+        <div className="tc-row"><span>Hydratation</span><b>{(daily[todayISO()] || {}).waterL ?? 0} / {hydroT} L</b></div>
+        {wx && <div className="tc-row"><span>Météo</span><b>{wx.temp}° (max {wx.tmax}°){wx.deltaP !== null && wx.deltaP !== undefined ? ` · pression ${wx.deltaP > 0 ? "+" : ""}${wx.deltaP} hPa` : ""}</b></div>}
+        <div style={{ marginTop: 10, fontSize: 14.5, lineHeight: 1.5 }}><b>Conseil :</b> {dailyAdvice(last, risk)}</div>
       </div>
 
       {risk.reasons.length > 0 && (
@@ -479,7 +554,7 @@ function Seances({ sessions, save }) {
     save([...sessions, s].sort((a, b) => a.date.localeCompare(b.date)));
     setF({ date: todayISO(), disc: f.disc, durationMin: null, distKm: "", rpe: null, note: "" });
   };
-  const del = id => save(sessions.filter(s => s.id !== id));
+  const del = id => { if (window.confirm("Supprimer cette séance ?")) save(sessions.filter(s => s.id !== id)); };
   const exportCsv = () => {
     const head = "date;discipline;duree_min;distance_km;rpe;tss;note\n";
     const rows = sessions.map(s => [s.date, s.disc, s.durationMin, s.distKm ?? "", s.rpe, s.tss, (s.note || "").replace(/;/g, ",")].join(";")).join("\n");
@@ -528,7 +603,8 @@ function Seances({ sessions, save }) {
 }
 
 /* ---------- Journal ---------- */
-function Journal({ daily, save, profile, sessions }) {
+function Journal({ daily, save, profile, sessions, wx }) {
+  const hydroT = hydrationTarget(profile, sessions, wx);
   const nt = nutritionTargets(profile, sessions);
   const [date, setDate] = useState(todayISO());
   const d = daily[date] || {};
@@ -545,12 +621,15 @@ function Journal({ daily, save, profile, sessions }) {
         <Chips label="Comment te sens-tu ?" options={["Très bien","Bien","Moyen","Fatigué","Épuisé"]} value={d.mood} onChange={v => set("mood", v)} />
         <Stepper label="Sommeil" value={d.sleepH} onChange={v => set("sleepH", v)} step={0.5} max={14} unit="h" />
         <Chips label="Qualité du sommeil" options={[1,2,3,4,5]} value={d.sleepQ} onChange={v => set("sleepQ", v)} />
-        <Stepper label="Eau bue" value={d.waterL} onChange={v => set("waterL", v)} step={0.25} max={8} unit="L" />
+        <Stepper label={`Eau bue — objectif ~${hydroT} L`} value={d.waterL} onChange={v => set("waterL", v)} step={0.25} max={8} unit="L" />
         <Chips label="Stress" options={[1,2,3,4,5]} value={d.stress} onChange={v => set("stress", v)} />
         <Stepper label="Cafés" value={d.coffee} onChange={v => set("coffee", v)} step={1} max={10} />
         <Stepper label="Alcool (verres)" value={d.alcohol} onChange={v => set("alcohol", v)} step={1} max={10} />
         <Stepper label="Temps d'écran" value={d.screenH} onChange={v => set("screenH", v)} step={0.5} max={16} unit="h" />
         <Chips label="Énergie" options={[1,2,3,4,5]} value={d.energy} onChange={v => set("energy", v)} />
+        <Chips label="Motivation" options={[1,2,3,4,5]} value={d.motivation} onChange={v => set("motivation", v)} />
+        <Chips label="Charge mentale" options={[1,2,3,4,5]} value={d.mental} onChange={v => set("mental", v)} />
+        <Chips label="Journée" options={["Bureau","Télétravail","Repos"]} value={d.workPlace} onChange={v => set("workPlace", v)} />
         <div className="tc-muted" style={{ fontSize: 13, marginTop: 12 }}>Tout est enregistré automatiquement.</div>
       </div>
       <div className="tc-card">
@@ -579,6 +658,7 @@ function Plus({ setView }) {
   const ITEMS = [
     ["plan", "Plan d\u2019entra\u00eenement", "G\u00e9n\u00e9r\u00e9 par l\u2019IA selon ta charge r\u00e9elle"],
     ["migraines", "Migraines", "Journal, risque du jour, corrélations"],
+    ["douleurs", "Douleurs", "Suivi par zone, détection d\u2019aggravation"],
     ["rapport", "Rapport", "Bilan 4 semaines, prédicteur course"],
     ["profil", "Profil & réglages", "Données perso, clé API, sauvegarde"],
   ];
@@ -597,14 +677,21 @@ function Plus({ setView }) {
 
 /* ---------- Migraines ---------- */
 function Migraines({ migraines, save, risk, correls }) {
-  const [f, setF] = useState({ date: todayISO(), intensity: null, durationH: null, trigger: "" });
+  const SYMPT = ["Aura","Nausée","Douleur œil","Sensib. lumière","Sensib. bruit","Tensions cervicales","Fatigue"];
+  const TRIG = ["Manque de sommeil","Déshydratation","Stress","Écran","Chaleur","Alcool","Caféine","Sport intense"];
+  const [f, setF] = useState({ date: todayISO(), intensity: null, durationH: null, symptoms: [], triggers: [], note: "" });
   const add = () => {
     if (!f.intensity) return;
     save([...migraines, { id: Date.now(), ...f }].sort((a, b) => a.date.localeCompare(b.date)));
-    setF({ date: todayISO(), intensity: null, durationH: null, trigger: "" });
+    setF({ date: todayISO(), intensity: null, durationH: null, symptoms: [], triggers: [], note: "" });
   };
-  const del = id => save(migraines.filter(m => m.id !== id));
+  const del = id => { if (window.confirm("Supprimer cet épisode ?")) save(migraines.filter(m => m.id !== id)); };
   const riskCol = risk.level === "faible" ? "var(--ok)" : risk.level === "modéré" ? "var(--warn)" : "var(--bad)";
+  const month = migraines.filter(m => m.date >= addDays(todayISO(), -30));
+  const avg = (arr, k) => { const v = arr.map(m => m[k]).filter(x => x !== null && x !== undefined); return v.length ? +(v.reduce((a, b) => a + +b, 0) / v.length).toFixed(1) : null; };
+  const trigCount = {};
+  migraines.forEach(m => (m.triggers || []).forEach(t => { trigCount[t] = (trigCount[t] || 0) + 1; }));
+  const topTrig = Object.entries(trigCount).sort((a, b) => b[1] - a[1]).slice(0, 3);
   return (
     <div>
       <h1 className="tc-h1">Migraines</h1>
@@ -614,12 +701,23 @@ function Migraines({ migraines, save, risk, correls }) {
           <b style={{ color: riskCol, textTransform: "capitalize", fontSize: 18 }}>{risk.level} · {risk.score}/10</b>
         </div>
       </div>
+      {migraines.length > 0 && (
+        <div className="tc-card">
+          <div className="tc-cardtitle">Statistiques</div>
+          <div className="tc-row"><span>Crises — 30 derniers jours</span><b>{month.length}</b></div>
+          <div className="tc-row"><span>Intensité moyenne</span><b>{avg(migraines, "intensity") ?? "—"}/10</b></div>
+          <div className="tc-row"><span>Durée moyenne</span><b>{avg(migraines, "durationH") !== null ? `${avg(migraines, "durationH")} h` : "—"}</b></div>
+          {topTrig.length > 0 && <div className="tc-row"><span>Déclencheurs fréquents</span><b style={{ textAlign: "right" }}>{topTrig.map(([t, n]) => `${t} (${n})`).join(", ")}</b></div>}
+        </div>
+      )}
       <div className="tc-card">
         <div className="tc-cardtitle">Nouvel épisode</div>
         <Field label="Date"><input className="tc-in" type="date" value={f.date} onChange={e => setF({ ...f, date: e.target.value })} /></Field>
         <Chips label="Intensité" options={[1,2,3,4,5,6,7,8,9,10]} value={f.intensity} onChange={v => setF({ ...f, intensity: v })} />
         <Stepper label="Durée" value={f.durationH} onChange={v => setF({ ...f, durationH: v })} step={0.5} max={72} unit="h" />
-        <Field label="Déclencheur supposé — optionnel"><input className="tc-in" value={f.trigger} onChange={e => setF({ ...f, trigger: e.target.value })} placeholder="écran, sommeil…" /></Field>
+        <MultiChips label="Symptômes" options={SYMPT} values={f.symptoms} onChange={v => setF({ ...f, symptoms: v })} />
+        <MultiChips label="Déclencheurs supposés" options={TRIG} values={f.triggers} onChange={v => setF({ ...f, triggers: v })} />
+        <Field label="Note — optionnel"><input className="tc-in" value={f.note} onChange={e => setF({ ...f, note: e.target.value })} /></Field>
         <button className="tc-bigbtn" onClick={add} disabled={!f.intensity} style={{ marginTop: 14 }}>Enregistrer l'épisode</button>
       </div>
       {correls ? (
@@ -643,7 +741,11 @@ function Migraines({ migraines, save, risk, correls }) {
             <span className="tc-discdot" style={{ background: "var(--bad)" }} />
             <div style={{ flex: 1 }}>
               <b>{frDate(m.date)}</b>
-              <div className="tc-muted" style={{ fontSize: 13 }}>Intensité {m.intensity}/10{m.durationH ? ` · ${m.durationH} h` : ""}{m.trigger ? ` · ${m.trigger}` : ""}</div>
+              <div className="tc-muted" style={{ fontSize: 13 }}>
+                Intensité {m.intensity}/10{m.durationH ? ` · ${m.durationH} h` : ""}
+                {(m.symptoms || []).length ? ` · ${m.symptoms.join(", ")}` : ""}
+                {(m.triggers || []).length ? ` · déclencheurs : ${m.triggers.join(", ")}` : (m.trigger ? ` · ${m.trigger}` : "")}
+              </div>
             </div>
             <button className="tc-del" onClick={() => del(m.id)} aria-label="Supprimer">✕</button>
           </div>
@@ -800,6 +902,8 @@ function Reglages({ apiKey, saveApiKey, data, restore }) {
         if (d.sessions) restore.sessions(d.sessions);
         if (d.daily) restore.daily(d.daily);
         if (d.migraines) restore.migraines(d.migraines);
+        if (d.pains) restore.pains(d.pains);
+        if (d.plan) restore.plan(d.plan);
         alert("Données restaurées.");
       } catch { alert("Fichier invalide."); }
     };
@@ -835,6 +939,8 @@ function PlanView({ plan, save, context, apiKey, sessions, saveSessions }) {
     setBusy(false);
   };
   const toggle = id => save(plan.map(d => d.id === id ? { ...d, done: !d.done } : d));
+  const shift = id => save(plan.map(d => d.id === id ? { ...d, date: addDays(d.date, 1) } : d).sort((a, b) => a.date.localeCompare(b.date)));
+  const removeDay = id => { if (window.confirm("Retirer cette séance du plan ?")) save(plan.filter(d => d.id !== id)); };
   const toSession = d => {
     if (d.disc === "repos" || !d.duree_min) return;
     const rpe = RPE_MAP[d.intensite] || 5;
@@ -863,14 +969,67 @@ function PlanView({ plan, save, context, apiKey, sessions, saveSessions }) {
               </div>
               <div style={{ marginTop: 6, fontSize: 15 }}><b>{d.titre}</b>{d.duree_min ? ` — ${d.duree_min} min · ${d.intensite}` : ""}</div>
               {d.consigne && <div className="tc-muted" style={{ fontSize: 13.5, marginTop: 3 }}>{d.consigne}</div>}
-              {d.disc !== "repos" && !d.done && d.duree_min > 0 && (
-                <button className="tc-mini" style={{ marginTop: 10 }} onClick={() => toSession(d)}>✓ Fait — enregistrer comme séance (TSS {estimateTSS(d.duree_min, RPE_MAP[d.intensite] || 5)})</button>
-              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                {d.disc !== "repos" && !d.done && d.duree_min > 0 && (
+                  <button className="tc-mini" onClick={() => toSession(d)}>✓ Fait → séance (TSS {estimateTSS(d.duree_min, RPE_MAP[d.intensite] || 5)})</button>
+                )}
+                <button className="tc-mini" onClick={() => shift(d.id)}>Décaler +1 j</button>
+                <button className="tc-mini" onClick={() => removeDay(d.id)}>Retirer</button>
+              </div>
             </div>
           ))}
           <div className="tc-muted" style={{ fontSize: 12.5 }}>Le plan est indicatif : il s'appuie sur ta charge et ton objectif, pas sur un test terrain. Douleur inhabituelle = repos, pas de négociation.</div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ---------- Douleurs ---------- */
+function Pains({ pains, save }) {
+  const ZONES = ["Nuque","Épaules","Dos","Hanches","Quadriceps","Genou D","Genou G","Mollets","Chevilles","Pieds"];
+  const [f, setF] = useState({ date: todayISO(), zone: null, intensity: null, note: "" });
+  const add = () => {
+    if (!f.zone || !f.intensity) return;
+    save([...pains, { id: Date.now(), ...f }].sort((a, b) => a.date.localeCompare(b.date)));
+    setF({ date: todayISO(), zone: null, intensity: null, note: "" });
+  };
+  const del = id => { if (window.confirm("Supprimer cette entrée ?")) save(pains.filter(p => p.id !== id)); };
+  const recent = pains.filter(p => p.date >= addDays(todayISO(), -14));
+  const alerts = [];
+  ZONES.forEach(z => {
+    const zp = recent.filter(p => p.zone === z).sort((a, b) => a.date.localeCompare(b.date));
+    if (zp.length >= 3 && zp[zp.length - 1].intensity >= zp[0].intensity) {
+      alerts.push(`${z} : ${zp.length} signalements en 14 j, intensité stable ou en hausse — allège les séances qui sollicitent cette zone, et consulte si ça persiste au-delà de 2 semaines.`);
+    }
+  });
+  return (
+    <div>
+      <h1 className="tc-h1">Douleurs</h1>
+      {alerts.map((a, i) => <div key={i} className="tc-card tc-empty" style={{ color: "var(--warn)" }}>⚠ {a}</div>)}
+      <div className="tc-card">
+        <div className="tc-cardtitle">Nouvelle douleur</div>
+        <Field label="Date"><input className="tc-in" type="date" value={f.date} onChange={e => setF({ ...f, date: e.target.value })} /></Field>
+        <Chips label="Zone" options={ZONES} value={f.zone} onChange={v => setF({ ...f, zone: v })} />
+        <Chips label="Intensité" options={[1,2,3,4,5,6,7,8,9,10]} value={f.intensity} onChange={v => setF({ ...f, intensity: v })} />
+        <Field label="Contexte — optionnel"><input className="tc-in" value={f.note} onChange={e => setF({ ...f, note: e.target.value })} placeholder="pendant la course, au réveil…" /></Field>
+        <button className="tc-bigbtn" onClick={add} disabled={!f.zone || !f.intensity} style={{ marginTop: 14 }}>Enregistrer</button>
+      </div>
+      <div className="tc-card">
+        <div className="tc-cardtitle">Historique ({pains.length})</div>
+        {pains.length === 0 && <div className="tc-muted">Aucune douleur enregistrée — tant mieux.</div>}
+        {[...pains].reverse().slice(0, 30).map(p => (
+          <div key={p.id} className="tc-session">
+            <span className="tc-discdot" style={{ background: "var(--warn)" }} />
+            <div style={{ flex: 1 }}>
+              <b>{p.zone}</b> · {frDate(p.date)}
+              <div className="tc-muted" style={{ fontSize: 13 }}>Intensité {p.intensity}/10{p.note ? ` · ${p.note}` : ""}</div>
+            </div>
+            <button className="tc-del" onClick={() => del(p.id)} aria-label="Supprimer">✕</button>
+          </div>
+        ))}
+      </div>
+      <div className="tc-muted" style={{ fontSize: 12.5 }}>Une douleur aiguë, brutale ou qui empêche de marcher relève d'un médecin, pas d'une app.</div>
     </div>
   );
 }
@@ -967,6 +1126,8 @@ function Css() {
       .tc-stepctl button { background:none; border:none; color:var(--accent); font-size:24px;
         width:46px; height:46px; font-family:inherit; }
       .tc-stepval { min-width:66px; text-align:center; font-size:15.5px; font-weight:600; }
+      .tc-stepin { width:72px; text-align:center; font-size:16px; font-weight:600; background:none;
+        border:none; color:var(--tx); font-family:inherit; padding:8px 0; }
       /* Chips */
       .tc-chipsrow { margin-top:14px; }
       .tc-chips { display:flex; gap:7px; flex-wrap:wrap; margin-top:8px; }
