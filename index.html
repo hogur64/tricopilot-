@@ -83,25 +83,40 @@ function computeLoads(sessions, daysBack = 120) {
 }
 
 /* ============ Risque migraine ============ */
-function migraineRisk(daily, loads, wx) {
+function migraineRisk(daily, loads, wx, migraines) {
+  const correls = migraineCorrelations(migraines || [], daily);
+  const wgt = {};
+  if (correls) {
+    const MAP = { "Sommeil (h)": "sleep", "Hydratation (L)": "water", "Stress (1-5)": "stress", "Écran (h)": "screen", "Cafés (n)": "coffee" };
+    correls.forEach(c => { const k = MAP[c.label]; if (k) wgt[k] = c.suspicious ? 1.5 : (Math.abs(c.rel) < 5 ? 0.5 : 1); });
+  }
+  const W = k => wgt[k] !== undefined ? wgt[k] : 1;
   const t = todayISO();
   const d0 = daily[t] || {}, d1 = daily[addDays(t, -1)] || {}, d2 = daily[addDays(t, -2)] || {};
   let score = 0; const reasons = [];
   const sleep = d1.sleepH ?? null;
-  if (sleep !== null && sleep < 6.5) { score += 2.5; reasons.push(`Sommeil court hier (${sleep} h)`); }
+  if (sleep !== null && sleep < 6.5) { score += 2.5 * W("sleep"); reasons.push(`Sommeil court hier (${sleep} h)`); }
   const debt = [d0, d1, d2].reduce((a, d) => a + Math.max(0, 7.5 - (d.sleepH ?? 7.5)), 0);
-  if (debt >= 3) { score += 1.5; reasons.push(`Dette de sommeil 3 j (${debt.toFixed(1)} h)`); }
-  if (d1.waterL !== undefined && d1.waterL < 1.5) { score += 1.5; reasons.push(`Hydratation faible hier (${d1.waterL} L)`); }
-  if ((d0.stress ?? 0) >= 4 || (d1.stress ?? 0) >= 4) { score += 1.5; reasons.push("Stress élevé"); }
-  if ((d1.screenH ?? 0) > 8) { score += 1; reasons.push(`Écran > 8 h hier (${d1.screenH} h)`); }
+  if (debt >= 3) { score += 1.5 * W("sleep"); reasons.push(`Dette de sommeil 3 j (${debt.toFixed(1)} h)`); }
+  if (d1.waterL !== undefined && d1.waterL < 1.5) { score += 1.5 * W("water"); reasons.push(`Hydratation faible hier (${d1.waterL} L)`); }
+  if ((d0.stress ?? 0) >= 4 || (d1.stress ?? 0) >= 4) { score += 1.5 * W("stress"); reasons.push("Stress élevé"); }
+  if ((d1.screenH ?? 0) > 8) { score += 1 * W("screen"); reasons.push(`Écran > 8 h hier (${d1.screenH} h)`); }
   const last = loads[loads.length - 1];
   if (last && last.tsb < -25) { score += 1.5; reasons.push(`Fatigue d'entraînement (TSB ${last.tsb})`); }
-  if (d1.coffee !== undefined && d0.coffee !== undefined && Math.abs(d0.coffee - d1.coffee) >= 2) { score += 1; reasons.push("Variation brutale de caféine"); }
+  if (d1.coffee !== undefined && d0.coffee !== undefined && Math.abs(d0.coffee - d1.coffee) >= 2) { score += 1 * W("coffee"); reasons.push("Variation brutale de caféine"); }
   if ((d1.alcohol ?? 0) > 0) { score += 0.5; reasons.push("Alcool hier"); }
+  const bm0 = d0.bedT ? (parseHM(d0.bedT) < 720 ? parseHM(d0.bedT) + 1440 : parseHM(d0.bedT)) : null;
+  const prevBeds = [];
+  for (let i = 1; i <= 7; i++) { const dd = daily[addDays(t, -i)]; if (dd && dd.bedT) { let m = parseHM(dd.bedT); if (m !== null) { if (m < 720) m += 1440; prevBeds.push(m); } } }
+  if (bm0 !== null && prevBeds.length >= 3) {
+    const meanB = prevBeds.reduce((a, b) => a + b, 0) / prevBeds.length;
+    const shift = Math.abs(bm0 - meanB);
+    if (shift > 90) { score += 1 * W("sleep"); reasons.push(`Coucher décalé de ${Math.round(shift)} min vs habitude`); }
+  }
   if (wx && wx.deltaP !== null && wx.deltaP !== undefined && wx.deltaP <= -5) { score += 1.5; reasons.push(`Chute de pression atmosphérique (${wx.deltaP} hPa)`); }
   if (wx && wx.tmax >= 30) { score += 0.5; reasons.push(`Forte chaleur (${wx.tmax}°C)`); }
   const level = score >= 5 ? "élevé" : score >= 2.5 ? "modéré" : "faible";
-  return { score: Math.min(10, +score.toFixed(1)), level, reasons };
+  return { score: Math.min(10, +score.toFixed(1)), level, reasons, personalized: !!correls, nEpisodes: (migraines || []).length };
 }
 
 /* ============ Corrélations migraines ============ */
@@ -140,28 +155,6 @@ function migraineCorrelations(migraines, daily) {
 function riegel(distKm, timeMin, targetKm) { return timeMin * Math.pow(targetKm / distKm, 1.06); }
 const fmtTime = (min) => { const h = Math.floor(min / 60), m = Math.round(min % 60); return h > 0 ? `${h}h${String(m).padStart(2, "0")}` : `${m} min`; };
 
-/* ============ Score global ============ */
-function globalScore(daily, loads, risk) {
-  const d1 = daily[addDays(todayISO(), -1)] || {};
-  let score = 70; const parts = [];
-  if (d1.sleepH !== undefined) {
-    const p = d1.sleepH >= 7.5 ? 15 : d1.sleepH >= 6.5 ? 8 : d1.sleepH >= 5.5 ? 0 : -10;
-    score += p; parts.push({ label: "Sommeil", val: p });
-  }
-  const last = loads[loads.length - 1];
-  if (last) {
-    const p = last.tsb > 5 ? 10 : last.tsb > -10 ? 5 : last.tsb > -25 ? -5 : -12;
-    score += p; parts.push({ label: "Forme (TSB)", val: p });
-  }
-  if (d1.stress !== undefined) {
-    const p = d1.stress <= 2 ? 5 : d1.stress === 3 ? 0 : -8;
-    score += p; parts.push({ label: "Stress", val: p });
-  }
-  score -= risk.score;
-  parts.push({ label: "Risque migraine", val: -risk.score });
-  return { score: Math.max(0, Math.min(100, Math.round(score))), parts };
-}
-
 /* ============ Contexte + appel coach IA (clé API personnelle) ============ */
 function buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx) {
   const last = loads[loads.length - 1] || {};
@@ -180,7 +173,7 @@ function buildContext(profile, sessions, daily, migraines, loads, plan, pains, w
   });
 }
 async function askCoach(history, context, apiKey) {
-  const system = `Tu es le coach personnel de l'utilisateur : préparation triathlon, santé, sommeil, nutrition sportive, prévention migraines. Tu réponds en français, direct, concret, chiffré. Tu utilises TOUJOURS les données ci-dessous. Tu signales quand une question relève d'un médecin. Données: ${context}`;
+  const system = `Tu es le coach personnel de l'utilisateur : préparation triathlon, santé, sommeil, nutrition sportive, prévention migraines. Tu réponds en français, direct, concret, chiffré. Tu appuies tes recommandations sur les référentiels reconnus (ACSM, IOC, physiologie de l'endurance, TrainingPeaks) en distinguant fait établi, pratique courante et incertitude. Tu n'inventes jamais de métrique ni de diagnostic. Tu utilises TOUJOURS les données ci-dessous. Tu signales quand une question relève d'un médecin. Données: ${context}`;
   const headers = { "content-type": "application/json" };
   const insideClaude = !!(window.storage && window.storage.get);
   if (!insideClaude) {
@@ -218,11 +211,63 @@ function hydrationTarget(profile, sessions, wx) {
   if (wx && wx.tmax >= 27) L += 0.5;
   return +L.toFixed(1);
 }
-function dailyAdvice(last, risk) {
+function dailyAdvice(last, risk, acwr) {
   if (risk.level === "élevé") return "Priorité prévention migraine : hydrate-toi, limite l'écran, séance légère uniquement.";
+  if (acwr && acwr.ratio !== null && acwr.ratio > 1.5) return `Charge aiguë très au-dessus de ta base (ACWR ${acwr.ratio}) : réduis le volume cette semaine.`;
   if (last && last.tsb < -25) return "Surcharge d'entraînement : repos ou mobilité aujourd'hui, pas de négociation.";
   if (last && last.tsb > 5) return "Fraîcheur au vert : bon jour pour placer une séance intense.";
   return "Zone productive : endurance 40-60 min si c'est au plan, sinon récupération active.";
+}
+
+/* ============ Horaires de sommeil & régularité circadienne ============ */
+function parseHM(t) { if (!t) return null; const p = t.split(":"); const h = +p[0], m = +p[1]; return isNaN(h) || isNaN(m) ? null : h * 60 + m; }
+function sleepDuration(bedT, wakeT) {
+  const b = parseHM(bedT), w = parseHM(wakeT);
+  if (b === null || w === null) return null;
+  let d = w - b; if (d <= 0) d += 1440;
+  if (d > 16 * 60) return null;
+  return Math.round((d / 60) * 4) / 4;
+}
+function bedRegularity(daily) {
+  const vals = [];
+  for (let i = 0; i < 7; i++) {
+    const d = daily[addDays(todayISO(), -i)];
+    if (d && d.bedT) { let m = parseHM(d.bedT); if (m === null) continue; if (m < 720) m += 1440; vals.push(m); }
+  }
+  if (vals.length < 3) return null;
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
+  const mm = Math.round(mean) % 1440;
+  return { sd: Math.round(sd), mean: `${String(Math.floor(mm / 60)).padStart(2, "0")}:${String(mm % 60).padStart(2, "0")}`, n: vals.length };
+}
+
+/* ============ ACWR & progression (Gabbett ; indicateur débattu — Impellizzeri 2020) ============ */
+function acwrStats(loads) {
+  const n = loads.length;
+  if (n < 28) return { ratio: null, ramp: null, acute: null, chronic: null };
+  const last7 = loads.slice(-7), prev7 = loads.slice(-14, -7), last28 = loads.slice(-28);
+  const sum = a => a.reduce((x, d) => x + d.tss, 0);
+  const acute = sum(last7) / 7, chronic = sum(last28) / 28;
+  const ratio = chronic >= 5 ? +(acute / chronic).toFixed(2) : null;
+  const prevSum = sum(prev7);
+  const ramp = prevSum >= 30 ? Math.round(((sum(last7) - prevSum) / prevSum) * 100) : null;
+  return { ratio, ramp, acute: Math.round(acute), chronic: Math.round(chronic) };
+}
+function acwrZone(r) {
+  if (r === null) return { label: "données insuffisantes", color: "var(--mut)" };
+  if (r < 0.8) return { label: "sous-charge", color: "var(--warn)" };
+  if (r <= 1.3) return { label: "zone optimale", color: "var(--ok)" };
+  if (r <= 1.5) return { label: "vigilance", color: "var(--warn)" };
+  return { label: "risque élevé", color: "var(--bad)" };
+}
+/* ============ Dette de sommeil 7 j (cible 7-9 h/nuit, NSF/AASM) ============ */
+function sleepDebt7(daily, target = 7.5) {
+  let debt = 0, n = 0;
+  for (let i = 1; i <= 7; i++) {
+    const d = daily[addDays(todayISO(), -i)];
+    if (d && d.sleepH !== undefined) { debt += Math.max(0, target - d.sleepH); n++; }
+  }
+  return { debt: +debt.toFixed(1), n };
 }
 
 /* ============ Objectifs nutrition (Mifflin-St Jeor, estimation) ============ */
@@ -231,12 +276,13 @@ function nutritionTargets(profile, sessions) {
   const bmr = profile.sex === "F" ? 10 * w + 6.25 * h - 5 * a - 161 : 10 * w + 6.25 * h - 5 * a + 5;
   const t = todayISO();
   const trainMin = sessions.filter(x => x.date === t).reduce((acc, x) => acc + x.durationMin, 0);
-  return { kcal: Math.round((bmr * 1.45 + trainMin * 8) / 50) * 50, prot: Math.round(w * 1.8), trainMin };
+  const gkg = trainMin === 0 ? 4 : trainMin <= 75 ? 6 : 8; // IOC : 3-5 repos/léger, 5-7 ~1h/j, 6-10 volume élevé
+  return { kcal: Math.round((bmr * 1.45 + trainMin * 8) / 50) * 50, prot: Math.round(w * 1.8), carb: Math.round((w * gkg) / 10) * 10, trainMin };
 }
 
 /* ============ Génération du plan 7 jours ============ */
 async function askPlan(context, apiKey) {
-  const system = `Tu es un entraineur triathlon expérimenté. Génère le plan des 7 prochains jours à partir de demain, adapté aux données fournies : charge actuelle (CTL/ATL/TSB), objectif de course et date, niveau, risque migraine, séances récentes. Règles : progression prudente, au moins 1 jour de repos complet, alterne les disciplines, si TSB < -20 allège la semaine. Réponds UNIQUEMENT avec un tableau JSON valide, sans texte autour, sans backticks. Format de chaque élément : {"date":"YYYY-MM-DD","disc":"natation|velo|course|muscu|mobilite|repos","titre":"titre court","duree_min":45,"intensite":"facile|modere|soutenu|dur","consigne":"une phrase concrète"}. Pour un jour de repos : duree_min 0, intensite "facile". Données: ${context}`;
+  const system = `Tu es un entraineur triathlon expérimenté qui suit les principes reconnus de périodisation et de progression de charge (ACWR 0,8-1,3, progression prudente). Génère le plan des 7 prochains jours à partir de demain, adapté aux données fournies : charge actuelle (CTL/ATL/TSB), objectif de course et date, niveau, risque migraine, séances récentes. Règles : progression prudente, au moins 1 jour de repos complet, alterne les disciplines, si TSB < -20 allège la semaine. Réponds UNIQUEMENT avec un tableau JSON valide, sans texte autour, sans backticks. Format de chaque élément : {"date":"YYYY-MM-DD","disc":"natation|velo|course|muscu|mobilite|repos","titre":"titre court","duree_min":45,"intensite":"facile|modere|soutenu|dur","consigne":"une phrase concrète"}. Pour un jour de repos : duree_min 0, intensite "facile". Données: ${context}`;
   const headers = { "content-type": "application/json" };
   const insideClaude = !!(window.storage && window.storage.get);
   if (!insideClaude) {
@@ -353,8 +399,7 @@ function TriCopilot() {
   useEffect(() => { window.scrollTo(0, 0); }, [view]);
 
   const loads = useMemo(() => computeLoads(sessions), [sessions]);
-  const risk = useMemo(() => migraineRisk(daily, loads, wx), [daily, loads, wx]);
-  const gScore = useMemo(() => globalScore(daily, loads, risk), [daily, loads, risk]);
+  const risk = useMemo(() => migraineRisk(daily, loads, wx, migraines), [daily, loads, wx, migraines]);
   const correls = useMemo(() => migraineCorrelations(migraines, daily), [migraines, daily]);
 
   const persist = {
@@ -379,7 +424,7 @@ function TriCopilot() {
     ["coach", "Coach", "◆"],
     ["plus", "Plus", "⋯"],
   ];
-  const sub = ["migraines", "rapport", "profil", "plan", "douleurs"].includes(view);
+  const sub = ["migraines", "rapport", "profil", "plan", "douleurs", "methodo"].includes(view);
 
   return (
     <div className={dark ? "tc-root tc-dark" : "tc-root tc-light"}>
@@ -390,13 +435,14 @@ function TriCopilot() {
         <button className="tc-theme" onClick={() => persist.theme(!dark)} aria-label="Changer de thème">{dark ? "☀" : "☾"}</button>
       </header>
       <main className="tc-page">
-        {view === "accueil" && <Accueil profile={profile} loads={loads} risk={risk} gScore={gScore} sessions={sessions} daily={daily} setView={setView} wx={wx} />}
+        {view === "accueil" && <Accueil profile={profile} loads={loads} risk={risk} sessions={sessions} daily={daily} setView={setView} wx={wx} />}
         {view === "seances" && <Seances sessions={sessions} save={persist.sessions} />}
         {view === "journal" && <Journal daily={daily} save={persist.daily} profile={profile} sessions={sessions} wx={wx} />}
         {view === "coach" && <Coach chat={chat} save={persist.chat} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} />}
         {view === "plus" && <Plus setView={setView} />}
         {view === "plan" && <PlanView plan={plan} save={persist.plan} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} sessions={sessions} saveSessions={persist.sessions} />}
         {view === "douleurs" && <Pains pains={pains} save={persist.pains} />}
+        {view === "methodo" && <Methodo />}
         {view === "migraines" && <Migraines migraines={migraines} save={persist.migraines} risk={risk} correls={correls} />}
         {view === "rapport" && <Rapport sessions={sessions} daily={daily} loads={loads} migraines={migraines} />}
         {view === "profil" && <><Onboarding initial={profile} onDone={persist.profile} edit /><Reglages apiKey={apiKey} saveApiKey={persist.apiKey} data={{ profile, sessions, daily, migraines, pains, plan }} restore={persist} /></>}
@@ -472,29 +518,47 @@ function Field({ label, children }) {
 }
 
 /* ---------- Accueil ---------- */
-function Accueil({ profile, loads, risk, gScore, sessions, daily, setView, wx }) {
+function Accueil({ profile, loads, risk, sessions, daily, setView, wx }) {
   const hydroT = hydrationTarget(profile, sessions, wx);
   const last = loads[loads.length - 1] || {};
+  const acwr = acwrStats(loads);
+  const zone = acwrZone(acwr.ratio);
+  const sd = sleepDebt7(daily);
+  const reg = bedRegularity(daily);
   const daysToRace = profile.goalDate ? Math.ceil((new Date(profile.goalDate) - new Date()) / 86400000) : null;
   const chartData = loads.slice(-42);
   const t = todayISO();
   const todayDone = !!daily[t] && Object.keys(daily[t]).length > 0;
-  const weekTss = loads.slice(-7).reduce((a, d) => a + d.tss, 0);
   const noData = sessions.length === 0 && Object.keys(daily).length === 0;
   const tsbCol = last.tsb > -10 ? "var(--ok)" : last.tsb > -25 ? "var(--warn)" : "var(--bad)";
   const riskCol = risk.level === "faible" ? "var(--ok)" : risk.level === "modéré" ? "var(--warn)" : "var(--bad)";
+  const sdCol = sd.n === 0 ? "var(--mut)" : sd.debt < 2 ? "var(--ok)" : sd.debt < 5 ? "var(--warn)" : "var(--bad)";
   return (
     <div>
       <h1 className="tc-h1">Salut {profile.name}</h1>
       {daysToRace !== null && daysToRace > 0 && <div className="tc-race">J−{daysToRace} · <b>{profile.goalRace}</b></div>}
-      {noData && <div className="tc-card tc-empty">Première utilisation : enregistre une séance et remplis ton journal du jour. Les scores deviennent fiables après ~2 semaines.</div>}
+      {noData && <div className="tc-card tc-empty">Première utilisation : enregistre une séance et remplis ton journal du jour. Les indicateurs deviennent fiables après ~2 semaines (l'ACWR après 4).</div>}
 
-      <div className="tc-hero">
-        <ScoreRing score={gScore.score} />
-        <div className="tc-herostats">
-          <div className="tc-pill"><span>Forme</span><b style={{ color: tsbCol }}>{last.tsb ?? "—"}</b></div>
-          <div className="tc-pill"><span>Migraine</span><b style={{ color: riskCol, textTransform: "capitalize" }}>{risk.level}</b></div>
-          <div className="tc-pill"><span>7 jours</span><b>{weekTss} TSS</b></div>
+      <div className="tc-metrics">
+        <div className="tc-metric">
+          <span className="tc-label">Forme · TSB</span>
+          <b style={{ color: tsbCol }}>{last.tsb ?? "—"}</b>
+          <small className="tc-muted">{last.tsb > 5 ? "frais" : last.tsb > -10 ? "productif" : last.tsb > -25 ? "fatigué" : "surcharge"}</small>
+        </div>
+        <div className="tc-metric">
+          <span className="tc-label">Blessure · ACWR</span>
+          <b style={{ color: zone.color }}>{acwr.ratio ?? "—"}</b>
+          <small className="tc-muted">{zone.label}</small>
+        </div>
+        <div className="tc-metric">
+          <span className="tc-label">Dette sommeil 7 j</span>
+          <b style={{ color: sdCol }}>{sd.n > 0 ? `${sd.debt} h` : "—"}</b>
+          <small className="tc-muted">{sd.n > 0 ? `sur ${sd.n} nuit${sd.n > 1 ? "s" : ""} saisies` : "journal vide"}</small>
+        </div>
+        <div className="tc-metric">
+          <span className="tc-label">Migraine</span>
+          <b style={{ color: riskCol, textTransform: "capitalize" }}>{risk.level}</b>
+          <small className="tc-muted">{risk.personalized ? `pondéré sur ${risk.nEpisodes} crises` : "pondération littérature"}</small>
         </div>
       </div>
 
@@ -509,9 +573,11 @@ function Accueil({ profile, loads, risk, gScore, sessions, daily, setView, wx })
         <div className="tc-cardtitle">Briefing du jour</div>
         <div className="tc-row"><span>Sommeil hier</span><b>{(daily[addDays(todayISO(), -1)] || {}).sleepH !== undefined ? `${daily[addDays(todayISO(), -1)].sleepH} h` : "non renseigné"}</b></div>
         <div className="tc-row"><span>Charge (TSB)</span><b>{last.tsb ?? "—"} · {last.tsb > 5 ? "frais" : last.tsb > -10 ? "productif" : last.tsb > -25 ? "fatigué" : "surcharge"}</b></div>
+        {acwr.ramp !== null && <div className="tc-row"><span>Progression hebdo</span><b style={{ color: acwr.ramp > 30 ? "var(--bad)" : acwr.ramp > 10 ? "var(--warn)" : "var(--tx)" }}>{acwr.ramp > 0 ? "+" : ""}{acwr.ramp}%</b></div>}
+        {reg && <div className="tc-row"><span>Coucher — régularité 7 j</span><b style={{ color: reg.sd <= 45 ? "var(--ok)" : reg.sd <= 75 ? "var(--warn)" : "var(--bad)" }}>{reg.mean} ±{reg.sd} min</b></div>}
         <div className="tc-row"><span>Hydratation</span><b>{(daily[todayISO()] || {}).waterL ?? 0} / {hydroT} L</b></div>
         {wx && <div className="tc-row"><span>Météo</span><b>{wx.temp}° (max {wx.tmax}°){wx.deltaP !== null && wx.deltaP !== undefined ? ` · pression ${wx.deltaP > 0 ? "+" : ""}${wx.deltaP} hPa` : ""}</b></div>}
-        <div style={{ marginTop: 10, fontSize: 14.5, lineHeight: 1.5 }}><b>Conseil :</b> {dailyAdvice(last, risk)}</div>
+        <div style={{ marginTop: 10, fontSize: 14.5, lineHeight: 1.5 }}><b>Conseil :</b> {dailyAdvice(last, risk, acwr)}</div>
       </div>
 
       {risk.reasons.length > 0 && (
@@ -528,22 +594,6 @@ function Accueil({ profile, loads, risk, gScore, sessions, daily, setView, wx })
     </div>
   );
 }
-function ScoreRing({ score }) {
-  const r = 50, c = 2 * Math.PI * r, off = c * (1 - score / 100);
-  const col = score >= 70 ? "var(--ok)" : score >= 45 ? "var(--warn)" : "var(--bad)";
-  return (
-    <div className="tc-ring">
-      <svg width="128" height="128" viewBox="0 0 128 128">
-        <circle cx="64" cy="64" r={r} fill="none" stroke="var(--grid)" strokeWidth="11" />
-        <circle cx="64" cy="64" r={r} fill="none" stroke={col} strokeWidth="11" strokeLinecap="round"
-          strokeDasharray={c} strokeDashoffset={off} transform="rotate(-90 64 64)" style={{ transition: "stroke-dashoffset .6s" }} />
-        <text x="64" y="72" textAnchor="middle" fill="var(--tx)" fontSize="32" fontWeight="700" fontFamily="'Barlow Condensed',sans-serif">{score}</text>
-      </svg>
-      <div className="tc-label" style={{ textAlign: "center" }}>Score du jour</div>
-    </div>
-  );
-}
-
 /* ---------- Séances ---------- */
 function Seances({ sessions, save }) {
   const [f, setF] = useState({ date: todayISO(), disc: "course", durationMin: null, distKm: "", rpe: null, note: "" });
@@ -609,6 +659,12 @@ function Journal({ daily, save, profile, sessions, wx }) {
   const [date, setDate] = useState(todayISO());
   const d = daily[date] || {};
   const set = (k, v) => save({ ...daily, [date]: { ...d, [k]: v } });
+  const setTime = (k, v) => {
+    const nd = { ...d, [k]: v };
+    const dur = sleepDuration(nd.bedT, nd.wakeT);
+    if (dur !== null) nd.sleepH = dur;
+    save({ ...daily, [date]: nd });
+  };
   return (
     <div>
       <h1 className="tc-h1">Journal</h1>
@@ -619,7 +675,12 @@ function Journal({ daily, save, profile, sessions, wx }) {
           <button className="tc-mini" onClick={() => setDate(addDays(date, 1))} disabled={date >= todayISO()}>›</button>
         </div>
         <Chips label="Comment te sens-tu ?" options={["Très bien","Bien","Moyen","Fatigué","Épuisé"]} value={d.mood} onChange={v => set("mood", v)} />
-        <Stepper label="Sommeil" value={d.sleepH} onChange={v => set("sleepH", v)} step={0.5} max={14} unit="h" />
+        <div className="tc-grid2">
+          <Field label="Couché hier soir"><input className="tc-in" type="time" value={d.bedT || ""} onChange={e => setTime("bedT", e.target.value)} /></Field>
+          <Field label="Levé ce matin"><input className="tc-in" type="time" value={d.wakeT || ""} onChange={e => setTime("wakeT", e.target.value)} /></Field>
+        </div>
+        <Stepper label="Sommeil (auto si heures saisies)" value={d.sleepH} onChange={v => set("sleepH", v)} step={0.25} max={14} unit="h" />
+        <Stepper label="Réveils nocturnes" value={d.wakeN} onChange={v => set("wakeN", v)} step={1} max={10} />
         <Chips label="Qualité du sommeil" options={[1,2,3,4,5]} value={d.sleepQ} onChange={v => set("sleepQ", v)} />
         <Stepper label={`Eau bue — objectif ~${hydroT} L`} value={d.waterL} onChange={v => set("waterL", v)} step={0.25} max={8} unit="L" />
         <Chips label="Stress" options={[1,2,3,4,5]} value={d.stress} onChange={v => set("stress", v)} />
@@ -640,8 +701,8 @@ function Journal({ daily, save, profile, sessions, wx }) {
       <div className="tc-card">
         <div className="tc-cardtitle">Nutrition</div>
         <div className="tc-muted" style={{ fontSize: 13, marginBottom: 4 }}>
-          Objectif estimé aujourd'hui : <b style={{ color: "var(--tx)" }}>~{nt.kcal} kcal</b> · <b style={{ color: "var(--tx)" }}>{nt.prot} g protéines</b>
-          {nt.trainMin > 0 ? ` (inclut ${nt.trainMin} min d'entraînement)` : ""} — formule Mifflin-St Jeor, à ajuster selon ton ressenti.
+          Objectif estimé aujourd'hui : <b style={{ color: "var(--tx)" }}>~{nt.kcal} kcal</b> · <b style={{ color: "var(--tx)" }}>{nt.prot} g protéines</b> · <b style={{ color: "var(--tx)" }}>~{nt.carb} g glucides</b>
+          {nt.trainMin > 0 ? ` (inclut ${nt.trainMin} min d'entraînement)` : ""} — réf. Mifflin-St Jeor, ACSM/IOC (protéines 1,6-2,2 g/kg, glucides 3-10 g/kg selon volume). Estimation, pas une prescription.
         </div>
         <Stepper label="Calories" value={d.kcal} onChange={v => set("kcal", v)} step={100} max={6000} unit="kcal" />
         <Stepper label="Protéines" value={d.prot} onChange={v => set("prot", v)} step={5} max={300} unit="g" />
@@ -661,6 +722,7 @@ function Plus({ setView }) {
     ["douleurs", "Douleurs", "Suivi par zone, détection d\u2019aggravation"],
     ["rapport", "Rapport", "Bilan 4 semaines, prédicteur course"],
     ["profil", "Profil & réglages", "Données perso, clé API, sauvegarde"],
+    ["methodo", "Méthodologie & sources", "Chaque métrique, sa référence, ses limites"],
   ];
   return (
     <div>
@@ -699,6 +761,11 @@ function Migraines({ migraines, save, risk, correls }) {
         <div className="tc-rowsplit">
           <span>Risque aujourd'hui</span>
           <b style={{ color: riskCol, textTransform: "capitalize", fontSize: 18 }}>{risk.level} · {risk.score}/10</b>
+        </div>
+        <div className="tc-muted" style={{ fontSize: 12.5, marginTop: 6 }}>
+          {risk.personalized
+            ? `Pondération personnalisée : tes ${risk.nEpisodes} crises repondèrent les facteurs (déclencheurs associés ×1,5, non associés ×0,5).`
+            : "Pondération par défaut issue de la littérature (sommeil, hydratation, stress, pression, caféine, alcool). Devient personnalisée dès 3 crises + 10 jours de journal."}
         </div>
       </div>
       {migraines.length > 0 && (
@@ -1034,6 +1101,35 @@ function Pains({ pains, save }) {
   );
 }
 
+/* ---------- Méthodologie ---------- */
+function Methodo() {
+  const ITEMS = [
+    ["Charge de séance (TSS estimé)", "sRPE de Foster (2001) convertie en équivalent TSS via un facteur d'intensité approché (IF ≈ 0,50 + RPE × 0,052).", "Approximation du TSS Coggan : sans capteur de puissance ni FC seuil, l'erreur est de l'ordre de ±15 %."],
+    ["ATL / CTL / TSB", "Modèle impulse-response de Banister, implémentation EWMA 7 j / 42 j popularisée par Coggan et TrainingPeaks. TSB = CTL − ATL de la veille.", "Les constantes 7/42 sont des conventions moyennes, pas calibrées individuellement."],
+    ["ACWR (risque de blessure)", "Ratio charge aiguë 7 j / chronique 28 j (moyennes glissantes), zones de Gabbett : 0,8-1,3 optimal, >1,5 vigilance forte. Progression hebdo affichée en complément.", "Indicateur débattu : Impellizzeri et al. (2020) contestent sa valeur prédictive causale. À lire comme un signal de vigilance, jamais comme une prédiction."],
+    ["Dette de sommeil", "Écart cumulé sur 7 nuits vs cible 7,5 h (fourchette adulte 7-9 h, National Sleep Foundation / AASM).", "Basée sur ta saisie déclarative, sans mesure objective (actigraphie)."],
+    ["Hydratation", "Base ~35 ml/kg/j + 0,6 L par heure d'entraînement (fourchette ACSM 0,4-0,8 L/h) + majoration par forte chaleur.", "Les pertes sudorales varient du simple au triple selon les individus ; ajuste selon ta soif et la couleur des urines."],
+    ["Nutrition", "Métabolisme de base Mifflin-St Jeor (1990) × facteur d'activité, + coût énergétique estimé de l'entraînement. Protéines 1,6-2,2 g/kg et glucides 3-10 g/kg selon volume (consensus ACSM/IOC endurance).", "Estimation à ±10-15 %. Aucune valeur ici n'est une prescription diététique."],
+    ["Prédicteur de course", "Formule de Riegel (1981), exposant 1,06.", "Valide entre distances proches et si le volume d'endurance suit ; extrapoler un marathon depuis un 10 km surestime souvent le niveau réel."],
+    ["Régularité du coucher", "Écart-type de l'heure de coucher sur 7 nuits. L'irrégularité des horaires de sommeil est un déclencheur documenté de migraines (crises de week-end dites let-down, changements d'horaire) ; la régularité circadienne est un marqueur de santé du sommeil reconnu (Phillips et al., 2017). Un décalage >90 min vs ton habitude entre dans le score de risque.", "Déclaratif, minimum 3 nuits saisies. L'écart-type simple est une approximation du Sleep Regularity Index complet."],
+    ["Risque migraine", "Facteurs documentés dans la littérature céphalées : privation de sommeil, déshydratation, stress, chute de pression atmosphérique, alcool, variations de caféine, temps d'écran. Le score est repondéré par TES corrélations personnelles dès 3 crises enregistrées.", "Association statistique ≠ causalité. Ce score n'est en aucun cas un diagnostic ; le diagnostic et le traitement des migraines relèvent d'un médecin."],
+    ["Corrélations migraines", "Comparaison de moyennes : fenêtre 24-48 h pré-crise vs baseline, seuil de signal à ±10 %.", "Méthode volontairement simple ; avec peu d'épisodes, les faux positifs sont probables. La fiabilité augmente avec le nombre de crises et la régularité du journal."],
+  ];
+  return (
+    <div>
+      <h1 className="tc-h1">Méthodologie</h1>
+      <p className="tc-muted" style={{ fontSize: 14, marginTop: -4 }}>Chaque indicateur de l'app, sa source, et surtout ses limites. Une métrique dont tu ne connais pas les limites est une métrique qui te ment.</p>
+      {ITEMS.map(([t, m, l], i) => (
+        <div key={i} className="tc-card">
+          <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 6 }}>{t}</div>
+          <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>{m}</div>
+          <div className="tc-muted" style={{ fontSize: 13, lineHeight: 1.5, marginTop: 6 }}><b>Limite :</b> {l}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ---------- Courbe de poids ---------- */
 function WeightChart({ daily }) {
   const pts = Object.keys(daily).filter(d => daily[d].weightKg !== undefined).sort().slice(-90)
@@ -1100,6 +1196,12 @@ function Css() {
       .tc-in { background:var(--bg); border:1px solid var(--line); color:var(--tx); border-radius:12px;
         padding:13px 14px; font-size:16px; font-family:inherit; width:100%; box-sizing:border-box; min-height:48px; }
       .tc-in:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+      /* Métriques */
+      .tc-metrics { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px; }
+      .tc-metric { background:var(--surface); border:1px solid var(--line); border-radius:16px;
+        padding:13px 14px; display:flex; flex-direction:column; gap:3px; }
+      .tc-metric b { font-family:'Barlow Condensed',sans-serif; font-size:26px; font-weight:700; line-height:1.1; }
+      .tc-metric small { font-size:11.5px; }
       /* Hero */
       .tc-hero { display:flex; align-items:center; gap:16px; margin-bottom:14px; }
       .tc-ring { flex-shrink:0; }
