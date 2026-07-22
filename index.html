@@ -129,6 +129,8 @@ function migraineCorrelations(migraines, daily) {
     { key: "stress", label: "Stress (1-5)", dir: "high" },
     { key: "screenH", label: "Écran (h)", dir: "high" },
     { key: "coffee", label: "Cafés (n)", dir: "high" },
+    { key: "wxDp", label: "Δ pression (hPa)", dir: "low" },
+    { key: "wxTx", label: "T° max (°C)", dir: "high" },
   ];
   const preDays = new Set();
   migraines.forEach(m => { preDays.add(addDays(m.date, -1)); preDays.add(m.date); });
@@ -280,6 +282,54 @@ function nutritionTargets(profile, sessions) {
   return { kcal: Math.round((bmr * 1.45 + trainMin * 8) / 50) * 50, prot: Math.round(w * 1.8), carb: Math.round((w * gkg) / 10) * 10, trainMin };
 }
 
+/* ============ Plan local par règles (sans API) — polarisé ~80/20, Seiler ============ */
+function generateLocalPlan(profile, loads, migLevel) {
+  const last = loads[loads.length - 1] || {};
+  const acwr = acwrStats(loads);
+  const LEVEL_H = { "débutant": 4.5, "intermédiaire": 6, "avancé": 8, "compétiteur": 10 };
+  const RACE_F = { "Triathlon S": 0.85, "Triathlon M": 1, "Half Ironman": 1.25, "Ironman": 1.5, "10 km": 0.7, "Semi-marathon": 0.8, "Marathon": 1 };
+  let hours = (LEVEL_H[profile.level] || 6) * (RACE_F[profile.goalRace] || 1);
+  const daysToRace = profile.goalDate ? Math.ceil((new Date(profile.goalDate) - new Date()) / 86400000) : null;
+  let mode = "semaine standard";
+  const recovery = (last.tsb !== undefined && last.tsb < -20) || (acwr.ratio !== null && acwr.ratio > 1.3);
+  if (recovery) { hours *= 0.6; mode = "semaine allégée (TSB/ACWR défavorables)"; }
+  if (daysToRace !== null && daysToRace > 0 && daysToRace <= 14) { hours *= daysToRace <= 7 ? 0.5 : 0.7; mode = "affûtage pré-course"; }
+  const total = Math.round(hours * 60);
+  const qualityOk = !recovery && migLevel !== "élevé" && !(daysToRace !== null && daysToRace <= 7);
+  const isTri = /thlon|Ironman/.test(profile.goalRace || "");
+  const tmpl = isTri ? [
+    { disc: "natation", share: 0.12, hard: false, titre: "Natation technique", consigne: "Éducatifs + aérobie, focus glisse et respiration." },
+    { disc: "course", share: 0.16, hard: true, titre: "Course — qualité", consigne: "Ex. 6×3 min allure soutenue, récup 90 s en trottinant. Échauffement 15 min." },
+    { disc: "velo", share: 0.18, hard: false, titre: "Vélo endurance", consigne: "Z2 strict, cadence 85-95 rpm." },
+    { disc: "repos", share: 0, hard: false, titre: "Repos complet", consigne: "La séance la plus importante de la semaine." },
+    { disc: "natation", share: 0.13, hard: false, titre: "Natation aérobie + renfo", consigne: "Volume continu + 15 min de gainage." },
+    { disc: "velo", share: 0.24, hard: false, titre: "Sortie vélo longue", consigne: "Z2 ; au-delà d'1 h 30, vise ~60 g de glucides/h." },
+    { disc: "course", share: 0.17, hard: false, titre: "Sortie course longue", consigne: "Allure facile conversationnelle, hydrate-toi." },
+  ] : [
+    { disc: "course", share: 0.18, hard: false, titre: "Footing facile", consigne: "Allure conversationnelle." },
+    { disc: "muscu", share: 0.12, hard: false, titre: "Renforcement", consigne: "Gainage, fessiers, mollets — prévention blessure." },
+    { disc: "course", share: 0.2, hard: true, titre: "Course — qualité", consigne: "Fractionné ou tempo selon la forme. Échauffement 15 min." },
+    { disc: "repos", share: 0, hard: false, titre: "Repos complet", consigne: "Assimilation." },
+    { disc: "course", share: 0.15, hard: false, titre: "Footing facile", consigne: "Court et souple." },
+    { disc: "velo", share: 0.13, hard: false, titre: "Vélo croisé", consigne: "Z2, décharge articulaire." },
+    { disc: "course", share: 0.22, hard: false, titre: "Sortie longue", consigne: "Progressif uniquement sur le dernier quart si sensations bonnes." },
+  ];
+  return tmpl.map((d, i) => {
+    const isHard = d.hard && qualityOk;
+    const duree = d.disc === "repos" ? 0 : Math.max(20, Math.round((total * d.share) / 5) * 5);
+    return {
+      id: Date.now() + i,
+      date: addDays(todayISO(), i + 1),
+      disc: d.disc,
+      titre: d.hard && !qualityOk ? d.titre.replace("qualité", "endurance (qualité annulée)") : d.titre,
+      duree_min: duree,
+      intensite: isHard ? "soutenu" : "facile",
+      consigne: (i === 0 ? `[${mode} — ~${(total / 60).toFixed(1)} h] ` : "") + (d.hard && !qualityOk ? "Qualité annulée cette semaine (récupération ou risque migraine) : reste en Z2. " : "") + d.consigne,
+      done: false,
+    };
+  });
+}
+
 /* ============ Génération du plan 7 jours ============ */
 async function askPlan(context, apiKey) {
   const system = `Tu es un entraineur triathlon expérimenté qui suit les principes reconnus de périodisation et de progression de charge (ACWR 0,8-1,3, progression prudente). Génère le plan des 7 prochains jours à partir de demain, adapté aux données fournies : charge actuelle (CTL/ATL/TSB), objectif de course et date, niveau, risque migraine, séances récentes. Règles : progression prudente, au moins 1 jour de repos complet, alterne les disciplines, si TSB < -20 allège la semaine. Réponds UNIQUEMENT avec un tableau JSON valide, sans texte autour, sans backticks. Format de chaque élément : {"date":"YYYY-MM-DD","disc":"natation|velo|course|muscu|mobilite|repos","titre":"titre court","duree_min":45,"intensite":"facile|modere|soutenu|dur","consigne":"une phrase concrète"}. Pour un jour de repos : duree_min 0, intensite "facile". Données: ${context}`;
@@ -397,6 +447,15 @@ function TriCopilot() {
     })();
   }, []);
   useEffect(() => { window.scrollTo(0, 0); }, [view]);
+  useEffect(() => {
+    if (!ready || !wx || wx.date !== todayISO()) return;
+    const t = todayISO();
+    const cur = daily[t] || {};
+    if (cur.wxP === undefined) {
+      const nd = { ...daily, [t]: { ...cur, wxP: wx.pressure, wxTx: wx.tmax, ...(wx.deltaP !== null && wx.deltaP !== undefined ? { wxDp: wx.deltaP } : {}) } };
+      setDaily(nd); saveKey("daily", nd);
+    }
+  }, [wx, ready]);
 
   const loads = useMemo(() => computeLoads(sessions), [sessions]);
   const risk = useMemo(() => migraineRisk(daily, loads, wx, migraines), [daily, loads, wx, migraines]);
@@ -440,11 +499,11 @@ function TriCopilot() {
         {view === "journal" && <Journal daily={daily} save={persist.daily} profile={profile} sessions={sessions} wx={wx} />}
         {view === "coach" && <Coach chat={chat} save={persist.chat} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} />}
         {view === "plus" && <Plus setView={setView} />}
-        {view === "plan" && <PlanView plan={plan} save={persist.plan} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} sessions={sessions} saveSessions={persist.sessions} />}
+        {view === "plan" && <PlanView plan={plan} save={persist.plan} apiKey={apiKey} context={buildContext(profile, sessions, daily, migraines, loads, plan, pains, wx)} sessions={sessions} saveSessions={persist.sessions} profile={profile} loads={loads} risk={risk} />}
         {view === "douleurs" && <Pains pains={pains} save={persist.pains} />}
         {view === "methodo" && <Methodo />}
         {view === "migraines" && <Migraines migraines={migraines} save={persist.migraines} risk={risk} correls={correls} />}
-        {view === "rapport" && <Rapport sessions={sessions} daily={daily} loads={loads} migraines={migraines} />}
+        {view === "rapport" && <Rapport sessions={sessions} daily={daily} loads={loads} migraines={migraines} profile={profile} />}
         {view === "profil" && <><Onboarding initial={profile} onDone={persist.profile} edit /><Reglages apiKey={apiKey} saveApiKey={persist.apiKey} data={{ profile, sessions, daily, migraines, pains, plan }} restore={persist} /></>}
       </main>
       <nav className="tc-tabbar">
@@ -575,6 +634,7 @@ function Accueil({ profile, loads, risk, sessions, daily, setView, wx }) {
         <div className="tc-row"><span>Charge (TSB)</span><b>{last.tsb ?? "—"} · {last.tsb > 5 ? "frais" : last.tsb > -10 ? "productif" : last.tsb > -25 ? "fatigué" : "surcharge"}</b></div>
         {acwr.ramp !== null && <div className="tc-row"><span>Progression hebdo</span><b style={{ color: acwr.ramp > 30 ? "var(--bad)" : acwr.ramp > 10 ? "var(--warn)" : "var(--tx)" }}>{acwr.ramp > 0 ? "+" : ""}{acwr.ramp}%</b></div>}
         {reg && <div className="tc-row"><span>Coucher — régularité 7 j</span><b style={{ color: reg.sd <= 45 ? "var(--ok)" : reg.sd <= 75 ? "var(--warn)" : "var(--bad)" }}>{reg.mean} ±{reg.sd} min</b></div>}
+        <div className="tc-row"><span>Journal — 14 derniers jours</span><b style={{ color: (() => { let c = 0; for (let i = 1; i <= 14; i++) { const dd = daily[addDays(todayISO(), -i)]; if (dd && dd.sleepH !== undefined) c++; } return c >= 12 ? "var(--ok)" : c >= 8 ? "var(--warn)" : "var(--bad)"; })() }}>{(() => { let c = 0; for (let i = 1; i <= 14; i++) { const dd = daily[addDays(todayISO(), -i)]; if (dd && dd.sleepH !== undefined) c++; } return c; })()}/14 j</b></div>
         <div className="tc-row"><span>Hydratation</span><b>{(daily[todayISO()] || {}).waterL ?? 0} / {hydroT} L</b></div>
         {wx && <div className="tc-row"><span>Météo</span><b>{wx.temp}° (max {wx.tmax}°){wx.deltaP !== null && wx.deltaP !== undefined ? ` · pression ${wx.deltaP > 0 ? "+" : ""}${wx.deltaP} hPa` : ""}</b></div>}
         <div style={{ marginTop: 10, fontSize: 14.5, lineHeight: 1.5 }}><b>Conseil :</b> {dailyAdvice(last, risk, acwr)}</div>
@@ -861,7 +921,7 @@ function Coach({ chat, save, context, apiKey }) {
 }
 
 /* ---------- Rapport ---------- */
-function Rapport({ sessions, daily, loads, migraines }) {
+function Rapport({ sessions, daily, loads, migraines, profile }) {
   const t = todayISO();
   const wk = (offset) => {
     const end = addDays(t, -7 * offset), start = addDays(end, -6);
@@ -892,6 +952,15 @@ function Rapport({ sessions, daily, loads, migraines }) {
         <div className="tc-cardtitle">Répartition — 4 semaines (min)</div>
         {discData.length ? <DiscBars data={discData} /> : <div className="tc-muted">Pas de séances sur la période.</div>}
       </div>
+      {profile.hrMax && +profile.hrMax > 100 && (
+        <div className="tc-card">
+          <div className="tc-cardtitle">Zones cardiaques (% FC max {profile.hrMax})</div>
+          {[["Z1 · Récupération", 0.5, 0.6], ["Z2 · Endurance", 0.6, 0.7], ["Z3 · Tempo", 0.7, 0.8], ["Z4 · Seuil", 0.8, 0.9], ["Z5 · VO2max", 0.9, 1.0]].map(([l, a, b], i) => (
+            <div key={i} className="tc-row"><span>{l}</span><b>{Math.round(profile.hrMax * a)}–{Math.round(profile.hrMax * b)} bpm</b></div>
+          ))}
+          <div className="tc-muted" style={{ fontSize: 12.5, marginTop: 8 }}>Zones en % FC max théorique — la méthode Karvonen (FC réserve) est plus précise si tu mesures ta FC de repos. L'essentiel de ton volume (~80 %) doit rester en Z1-Z2.</div>
+        </div>
+      )}
       <div className="tc-card">
         <div className="tc-cardtitle">Poids — 90 jours</div>
         <WeightChart daily={daily} />
@@ -985,6 +1054,16 @@ function Reglages({ apiKey, saveApiKey, data, restore }) {
       <div className="tc-cardtitle" style={{ marginTop: 22 }}>Sauvegarde</div>
       <div className="tc-muted" style={{ fontSize: 13, marginBottom: 10 }}>Exporte régulièrement : si le stockage du navigateur est effacé, tout part avec.</div>
       <button className="tc-bigbtn tc-bigbtn2" onClick={exportAll}>Exporter mes données (JSON)</button>
+      <button className="tc-bigbtn tc-bigbtn2" style={{ marginTop: 10 }} onClick={() => {
+        const days = Object.keys(data.daily || {}).sort();
+        const keys = ["sleepH","sleepQ","bedT","wakeT","wakeN","waterL","stress","coffee","alcohol","screenH","energy","motivation","mental","workPlace","mood","weightKg","waistCm","kcal","prot","carb","fat","wxP","wxDp","wxTx"];
+        const head = "date;" + keys.join(";") + "\n";
+        const rows = days.map(dt => dt + ";" + keys.map(k => { const v = (data.daily[dt] || {})[k]; return v === undefined ? "" : String(v).replace(/;/g, ","); }).join(";")).join("\n");
+        const mig = "\n\ndate;intensite;duree_h;symptomes;declencheurs;note\n" + (data.migraines || []).map(m => [m.date, m.intensity, m.durationH ?? "", (m.symptoms || []).join("|"), (m.triggers || []).join("|"), (m.note || "").replace(/;/g, ",")].join(";")).join("\n");
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([head + rows + mig], { type: "text/csv" }));
+        a.download = "tricopilot-journal-" + todayISO() + ".csv"; a.click();
+      }}>Exporter journal + migraines (CSV)</button>
       <button className="tc-bigbtn tc-bigbtn2" onClick={() => fileRef.current.click()} style={{ marginTop: 10 }}>Restaurer une sauvegarde</button>
       <input ref={fileRef} type="file" accept=".json" style={{ display: "none" }} onChange={importAll} />
     </div>
@@ -992,17 +1071,21 @@ function Reglages({ apiKey, saveApiKey, data, restore }) {
 }
 
 /* ---------- Plan d'entraînement ---------- */
-function PlanView({ plan, save, context, apiKey, sessions, saveSessions }) {
+function PlanView({ plan, save, context, apiKey, sessions, saveSessions, profile, loads, risk }) {
   const insideClaude = !!(window.storage && window.storage.get);
   const needKey = !insideClaude && !apiKey;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const RPE_MAP = { facile: 3, modere: 5, soutenu: 7, dur: 8 };
   const generate = async () => {
-    if (needKey || busy) return;
+    if (busy) return;
     setBusy(true); setErr("");
-    try { save(await askPlan(context, apiKey)); }
-    catch { setErr("Génération impossible. Vérifie ta clé API et ta connexion, puis réessaie."); }
+    if (insideClaude || apiKey) {
+      try { save(await askPlan(context, apiKey)); setBusy(false); return; }
+      catch { setErr("API indisponible — plan généré par la méthode locale (règles 80/20)."); }
+    }
+    try { save(generateLocalPlan(profile, loads, risk.level)); }
+    catch { setErr("Génération impossible."); }
     setBusy(false);
   };
   const toggle = id => save(plan.map(d => d.id === id ? { ...d, done: !d.done } : d));
@@ -1018,8 +1101,8 @@ function PlanView({ plan, save, context, apiKey, sessions, saveSessions }) {
   return (
     <div>
       <h1 className="tc-h1">Plan d'entraînement</h1>
-      {needKey && <div className="tc-card tc-empty">La génération nécessite ta clé API Anthropic (Plus → Profil & réglages).</div>}
-      <button className="tc-bigbtn" onClick={generate} disabled={busy || needKey}>
+      {needKey && <div className="tc-card tc-empty">Sans clé API, le plan est généré par un moteur de règles local : répartition polarisée ~80/20 (Seiler), un seul jour de qualité, allègement automatique si TSB/ACWR défavorables, affûtage à J−14.</div>}
+      <button className="tc-bigbtn" onClick={generate} disabled={busy}>
         {busy ? "Génération en cours…" : plan ? "Régénérer le plan (7 jours)" : "Générer mon plan (7 jours)"}
       </button>
       {err && <div className="tc-card tc-empty" style={{ marginTop: 12, color: "var(--bad)" }}>{err}</div>}
